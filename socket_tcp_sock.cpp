@@ -7,6 +7,7 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <vector>
 #pragma comment(lib, "ws2_32.lib")
 
 std::atomic<bool> connected(true);
@@ -69,40 +70,78 @@ void sendToServer(SOCKET clientSocket)
         std::cout << "请输入要发送的消息: ";
         std::getline(std::cin, message);
 
-        int bytesSent = send(clientSocket, message.c_str(), static_cast<int>(message.length()), 0);
+		uint32_t length = htonl(static_cast<uint32_t>(message.length()));
+		std::vector<char> send_buffer(4 + message.length());
+		memcpy(send_buffer.data(), &length, 4);
+		memcpy(send_buffer.data() + 4, message.c_str(), message.length());
 
-        if (bytesSent > 0)
+		int total_sent = 0;
+		int to_send = static_cast<int>(send_buffer.size());
+
+        while (total_sent < to_send)
         {
-            std::cout << "已发送消息: " << message << std::endl;
+            int sent = send(clientSocket, send_buffer.data() + total_sent, to_send - total_sent, 0);
+            if (sent <= 0)
+            {
+                std::cout << "发送消息失败！错误码: " << WSAGetLastError() << std::endl;
+                return;
+            }
+            total_sent += sent;
         }
-        else
-        {
-            std::cout << "发送消息失败" << std::endl;
-        }
+
+		if (total_sent == to_send)
+		{
+			std::cout << "消息发送成功！ " << message.length() << "字节" << std::endl;
+		}
     }
 
 }
 
 void receiveFromServer(SOCKET clientSocket)
 {
+    std::vector<char> buffer;
     while (connected)
     {
-        char buffer[1024];
-        int bytesReceived = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+        char temp_buffer[2000];
+        int bytes_received = recv(clientSocket, temp_buffer, sizeof(temp_buffer), 0);
 
-        if (bytesReceived > 0)
+        if (bytes_received > 0)
         {
-            buffer[bytesReceived] = '\0';
-            std::cout << "服务器回复: " << buffer << std::endl;
+            buffer.insert(buffer.end(), temp_buffer, temp_buffer + bytes_received);
+
+            while (buffer.size() >= 4)
+            {
+                uint32_t length = 0;
+                memcpy(&length, buffer.data(), 4);
+                length = ntohl(length);
+
+                if (buffer.size() < 4 + length)
+                {
+                    break; // 等待更多数据
+                }
+
+                std::string message(buffer.begin() + 4, buffer.begin() + 4 + length);
+                buffer.erase(buffer.begin(), buffer.begin() + 4 + length);
+
+                std::cout << "收到服务器消息: " << message << std::endl;
+
+            }
         }
-        else if (bytesReceived == 0)
+        else if (bytes_received == 0)
         {
-            std::cout << "服务器关闭了连接" << std::endl;
+            std::cout << "服务器已关闭连接" << std::endl;
+            connected = false;
+            break;
         }
         else
         {
-            std::cout << "接收回复失败" << std::endl;
-            break;
+            int error = WSAGetLastError();
+            if (error != WSAEWOULDBLOCK && error != WSAEINTR)
+            {
+                std::cout << "接收消息失败！错误码: " << error << std::endl;
+                connected = false;
+                break;
+            }
         }
     }
 }
@@ -116,11 +155,12 @@ int main()
     std::thread send(sendToServer, clientSocket);
     std::thread receive(receiveFromServer, clientSocket);
 
+    send.join();
+    receive.join();
 
     // 关闭连接
     std::cout << "正在关闭连接..." << std::endl;
-    send.join();
-    receive.join();
+
     connected = false;
     closesocket(clientSocket);
     WSACleanup();
